@@ -5,12 +5,9 @@ Sync active Canton validators into Attio (Validators object).
 - Fetches validator licenses from https://api.cantonnodes.com/v0/admin/validator/licenses
 - Follows pagination using `next_page_token` / `after`
 - Filters to validators active in the last 7 days (payload.lastActiveAt)
+- Deduplicates by validator ID
 - Upserts into Attio using PUT /v2/objects/{object}/records?matching_attribute=id
-
-Attio fields used:
-- id              (slug: "id")              ← unique validator ID from Canton: payload.validator
-- sponsor         (slug: "sponsor")         ← sponsor from Canton: payload.sponsor
-- contact_email_1 (slug: "contact_email_1") ← contactPoint from Canton: payload.metadata.contactPoint
+- Uses a thread pool for concurrent Attio writes
 """
 
 import os
@@ -18,6 +15,7 @@ import sys
 import time
 import logging
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
@@ -43,8 +41,12 @@ ATTIO_ATTR_CONTACT_POINT = "contact_email_1"
 # Name of the environment variable that holds the Attio API token
 ATTIO_TOKEN_ENV_VAR = "ATTIO_API_TOKEN"
 
-# Optional tiny delay between Attio calls
-ATTIO_REQUEST_DELAY_SECONDS = 0.05  # 50 ms
+# Base delay used for backoff between retries (seconds)
+ATTIO_REQUEST_DELAY_SECONDS = 0.1
+
+# Number of concurrent Attio write requests.
+# 8 workers keeps us well below Attio's 25 writes/sec limit in practice.
+ATTIO_MAX_WORKERS = 8
 
 
 # ------------- Logging -------------
@@ -118,7 +120,7 @@ def filter_active_licenses(licenses, lookback_days=ACTIVE_LOOKBACK_DAYS):
             active.append(lic)
 
     logging.info(
-        "Filtered to %d active validators in the last %d days.",
+        "Filtered to %d active validator licenses in the last %d days.",
         len(active),
         lookback_days,
     )
@@ -141,10 +143,10 @@ def get_attio_headers():
 
 def upsert_validator_into_attio(license_obj):
     """
-    Upsert one validator into Attio using the Assert-record style endpoint:
+    Upsert one validator into Attio using:
     PUT /v2/objects/{object}/records?matching_attribute=id
 
-    Keys in data.values are attribute slugs (id, sponsor, contact_email_1).
+    Returns True on success, False on permanent failure.
     """
     payload = license_obj.get("payload") or {}
     metadata = payload.get("metadata") or {}
@@ -154,16 +156,13 @@ def upsert_validator_into_attio(license_obj):
     contact_point = metadata.get("contactPoint")
 
     if not validator_id:
-        return
+        return False
 
-    # Build the values payload using attribute slugs
     values = {
         ATTIO_ATTR_VALIDATOR: validator_id
     }
-
     if sponsor is not None:
         values[ATTIO_ATTR_SPONSOR] = sponsor
-
     if contact_point is not None:
         values[ATTIO_ATTR_CONTACT_POINT] = contact_point
 
@@ -172,25 +171,92 @@ def upsert_validator_into_attio(license_obj):
         "matching_attribute": ATTIO_ATTR_VALIDATOR
     }
 
-    body = {
-        "data": {
-            "values": values
-        }
-    }
+    max_attempts = 4
 
-    response = requests.put(url, headers=get_attio_headers(), params=params, json=body, timeout=30)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.put(
+                url,
+                headers=get_attio_headers(),
+                params=params,
+                json={"data": {"values": values}},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(
+                "Network error talking to Attio for validator=%s (attempt %d/%d): %s",
+                validator_id,
+                attempt,
+                max_attempts,
+                e,
+            )
+            response = None
 
-    if not response.ok:
-        logging.error(
-            "Failed to upsert validator=%s into Attio (HTTP %s): %s",
+        # Decide whether to retry or stop based on the response
+        if response is None:
+            # network error → retry unless out of attempts
+            should_retry = True
+            sleep_seconds = ATTIO_REQUEST_DELAY_SECONDS * attempt
+        else:
+            status = response.status_code
+
+            if status == 429:
+                # Rate limit exceeded. Attio docs say next second usually. :contentReference[oaicite:2]{index=2}
+                logging.warning(
+                    "Rate limit (429) from Attio for validator=%s (attempt %d/%d).",
+                    validator_id,
+                    attempt,
+                    max_attempts,
+                )
+                should_retry = True
+                sleep_seconds = max(1.0, ATTIO_REQUEST_DELAY_SECONDS * attempt)
+            elif 500 <= status < 600:
+                logging.warning(
+                    "Transient 5xx error HTTP %s for validator=%s (attempt %d/%d).",
+                    status,
+                    validator_id,
+                    attempt,
+                    max_attempts,
+                )
+                should_retry = True
+                sleep_seconds = ATTIO_REQUEST_DELAY_SECONDS * attempt
+            elif not response.ok:
+                # Non-retryable error: log and stop
+                logging.error(
+                    "Non-retryable Attio error HTTP %s for validator=%s: %s",
+                    status,
+                    validator_id,
+                    response.text,
+                )
+                return False
+            else:
+                # Success
+                if attempt > 1:
+                    logging.info(
+                        "Succeeded for validator=%s after %d attempts.",
+                        validator_id,
+                        attempt,
+                    )
+                return True
+
+        if not should_retry or attempt == max_attempts:
+            logging.error(
+                "Giving up on validator=%s after %d attempts.",
+                validator_id,
+                max_attempts,
+            )
+            return False
+
+        logging.info(
+            "Retrying validator=%s in %.2fs (attempt %d/%d)...",
             validator_id,
-            response.status_code,
-            response.text,
+            sleep_seconds,
+            attempt + 1,
+            max_attempts,
         )
-    else:
-        logging.debug("Upserted validator=%s into Attio.", validator_id)
+        time.sleep(sleep_seconds)
 
-    time.sleep(ATTIO_REQUEST_DELAY_SECONDS)
+    return False
 
 
 # ------------- Main entrypoint -------------
@@ -200,14 +266,49 @@ def main():
 
     try:
         licenses = fetch_all_validator_licenses()
-        active_licenses = filter_active_licenses(licenses, lookback_days=ACTIVE_LOOKBACK_DAYS)
+        active_licenses = filter_active_licenses(
+            licenses,
+            lookback_days=ACTIVE_LOOKBACK_DAYS,
+        )
 
+        # Deduplicate by validator ID
+        unique_by_validator = {}
         for lic in active_licenses:
-            upsert_validator_into_attio(lic)
+            payload = lic.get("payload") or {}
+            vid = payload.get("validator")
+            if not vid:
+                continue
+            unique_by_validator[vid] = lic
+
+        unique_licenses = list(unique_by_validator.values())
+        logging.info(
+            "After de-duplication, %d unique validators will be synced (from %d active licenses).",
+            len(unique_licenses),
+            len(active_licenses),
+        )
+
+        success_count = 0
+        fail_count = 0
+
+        # Run Attio upserts concurrently
+        with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
+            futures = [executor.submit(upsert_validator_into_attio, lic)
+                       for lic in unique_licenses]
+
+            for future in as_completed(futures):
+                try:
+                    if future.result():
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                except Exception as exc:
+                    logging.exception("Unexpected exception in worker: %s", exc)
+                    fail_count += 1
 
         logging.info(
-            "Completed sync of %d active validators into Attio.",
-            len(active_licenses),
+            "Completed sync. %d validators upserted successfully, %d failed.",
+            success_count,
+            fail_count,
         )
 
     except Exception as exc:
