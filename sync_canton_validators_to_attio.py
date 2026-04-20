@@ -49,6 +49,11 @@ ATTIO_REQUEST_DELAY_SECONDS = 0.1
 # 8 workers keeps us well below Attio's 25 writes/sec limit in practice.
 ATTIO_MAX_WORKERS = 8
 
+# When DRY_RUN is truthy, the script performs no upserts or deletes — it just
+# logs what it would do. Useful for verifying the active set and the stale
+# deletion list before letting the job actually mutate Attio.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
+
 
 # ------------- Logging -------------
 
@@ -393,6 +398,8 @@ def delete_attio_record(record_id, validator_id):
 
 def main():
     logging.info("Starting Canton Scan → Attio Validators sync...")
+    if DRY_RUN:
+        logging.info("DRY_RUN=1 — no Attio writes or deletes will be performed.")
 
     try:
         licenses = fetch_all_validator_licenses()
@@ -420,26 +427,32 @@ def main():
         success_count = 0
         fail_count = 0
 
-        # Run Attio upserts concurrently
-        with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
-            futures = [executor.submit(upsert_validator_into_attio, lic)
-                       for lic in unique_licenses]
+        if DRY_RUN:
+            logging.info(
+                "DRY_RUN: would upsert %d validators into Attio (skipping).",
+                len(unique_licenses),
+            )
+        else:
+            # Run Attio upserts concurrently
+            with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
+                futures = [executor.submit(upsert_validator_into_attio, lic)
+                           for lic in unique_licenses]
 
-            for future in as_completed(futures):
-                try:
-                    if future.result():
-                        success_count += 1
-                    else:
+                for future in as_completed(futures):
+                    try:
+                        if future.result():
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception as exc:
+                        logging.exception("Unexpected exception in worker: %s", exc)
                         fail_count += 1
-                except Exception as exc:
-                    logging.exception("Unexpected exception in worker: %s", exc)
-                    fail_count += 1
 
-        logging.info(
-            "Completed upserts. %d validators upserted successfully, %d failed.",
-            success_count,
-            fail_count,
-        )
+            logging.info(
+                "Completed upserts. %d validators upserted successfully, %d failed.",
+                success_count,
+                fail_count,
+            )
 
         # Prune stale validators: anything in Attio whose `id` is NOT in the
         # active set (active in the last ACTIVE_LOOKBACK_DAYS days).
@@ -462,29 +475,35 @@ def main():
             for _, vid in stale:
                 logging.info("Will delete stale validator=%s", vid)
 
-            delete_success = 0
-            delete_fail = 0
+            if DRY_RUN:
+                logging.info(
+                    "DRY_RUN: would delete %d stale validators from Attio (skipping).",
+                    len(stale),
+                )
+            else:
+                delete_success = 0
+                delete_fail = 0
 
-            with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
-                futures = [
-                    executor.submit(delete_attio_record, rid, vid)
-                    for rid, vid in stale
-                ]
-                for future in as_completed(futures):
-                    try:
-                        if future.result():
-                            delete_success += 1
-                        else:
+                with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
+                    futures = [
+                        executor.submit(delete_attio_record, rid, vid)
+                        for rid, vid in stale
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            if future.result():
+                                delete_success += 1
+                            else:
+                                delete_fail += 1
+                        except Exception as exc:
+                            logging.exception("Unexpected exception in delete worker: %s", exc)
                             delete_fail += 1
-                    except Exception as exc:
-                        logging.exception("Unexpected exception in delete worker: %s", exc)
-                        delete_fail += 1
 
-            logging.info(
-                "Completed deletions. %d stale validators deleted, %d failed.",
-                delete_success,
-                delete_fail,
-            )
+                logging.info(
+                    "Completed deletions. %d stale validators deleted, %d failed.",
+                    delete_success,
+                    delete_fail,
+                )
 
     except Exception as exc:
         logging.exception("Sync failed: %s", exc)
