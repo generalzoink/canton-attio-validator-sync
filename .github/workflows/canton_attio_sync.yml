@@ -6,6 +6,11 @@ on:
     - cron: "0 3 * * *"
   # Allow manual runs from the GitHub UI
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run — log active/stale counts without writing to Attio"
+        type: boolean
+        default: false
 
 jobs:
   sync:
@@ -27,5 +32,6 @@ jobs:
       - name: Run sync script
         env:
           ATTIO_API_TOKEN: ${{ secrets.ATTIO_API_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
         run: |
           python sync_canton_validators_to_attio.py

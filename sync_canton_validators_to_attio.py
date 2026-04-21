@@ -7,6 +7,7 @@ Sync active Canton validators into Attio (Validators object).
 - Filters to validators active in the last 7 days (payload.lastActiveAt)
 - Deduplicates by validator ID
 - Upserts into Attio using PUT /v2/objects/{object}/records?matching_attribute=id
+- Deletes Attio records whose validator ID is not in the active set
 - Uses a thread pool for concurrent Attio writes
 """
 
@@ -47,6 +48,11 @@ ATTIO_REQUEST_DELAY_SECONDS = 0.1
 # Number of concurrent Attio write requests.
 # 8 workers keeps us well below Attio's 25 writes/sec limit in practice.
 ATTIO_MAX_WORKERS = 8
+
+# When DRY_RUN is truthy, the script performs no upserts or deletes — it just
+# logs what it would do. Useful for verifying the active set and the stale
+# deletion list before letting the job actually mutate Attio.
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
 
 # ------------- Logging -------------
@@ -259,10 +265,141 @@ def upsert_validator_into_attio(license_obj):
     return False
 
 
+def list_all_attio_validators():
+    """
+    List every record in the Attio Validators object via
+    POST /v2/objects/{object}/records/query, paginating with offset/limit.
+
+    Returns a list of (record_id, validator_id) tuples. Records missing the
+    `id` attribute are skipped so they are never considered for deletion.
+    """
+    url = f"{ATTIO_API_BASE_URL}/objects/{ATTIO_VALIDATORS_OBJECT_ID}/records/query"
+    limit = 500
+    offset = 0
+    results = []
+
+    while True:
+        response = requests.post(
+            url,
+            headers=get_attio_headers(),
+            json={"limit": limit, "offset": offset},
+            timeout=30,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        records = data.get("data") or []
+        for rec in records:
+            record_id = (rec.get("id") or {}).get("record_id")
+            id_values = (rec.get("values") or {}).get(ATTIO_ATTR_VALIDATOR) or []
+            validator_id = id_values[0].get("value") if id_values else None
+            if record_id and validator_id:
+                results.append((record_id, validator_id))
+
+        if len(records) < limit:
+            break
+        offset += limit
+
+    logging.info("Fetched %d existing Validator records from Attio.", len(results))
+    return results
+
+
+def delete_attio_record(record_id, validator_id):
+    """
+    Delete one record from the Attio Validators object, with retry on
+    transient failures. A 404 is treated as success (already gone).
+    """
+    url = f"{ATTIO_API_BASE_URL}/objects/{ATTIO_VALIDATORS_OBJECT_ID}/records/{record_id}"
+
+    max_attempts = 4
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.delete(
+                url,
+                headers=get_attio_headers(),
+                timeout=30,
+            )
+        except requests.exceptions.RequestException as e:
+            logging.warning(
+                "Network error deleting validator=%s (attempt %d/%d): %s",
+                validator_id,
+                attempt,
+                max_attempts,
+                e,
+            )
+            response = None
+
+        if response is None:
+            should_retry = True
+            sleep_seconds = ATTIO_REQUEST_DELAY_SECONDS * attempt
+        else:
+            status = response.status_code
+
+            if status == 429:
+                logging.warning(
+                    "Rate limit (429) deleting validator=%s (attempt %d/%d).",
+                    validator_id,
+                    attempt,
+                    max_attempts,
+                )
+                should_retry = True
+                sleep_seconds = max(1.0, ATTIO_REQUEST_DELAY_SECONDS * attempt)
+            elif 500 <= status < 600:
+                logging.warning(
+                    "Transient 5xx HTTP %s deleting validator=%s (attempt %d/%d).",
+                    status,
+                    validator_id,
+                    attempt,
+                    max_attempts,
+                )
+                should_retry = True
+                sleep_seconds = ATTIO_REQUEST_DELAY_SECONDS * attempt
+            elif status == 404:
+                return True
+            elif not response.ok:
+                logging.error(
+                    "Non-retryable Attio delete error HTTP %s for validator=%s: %s",
+                    status,
+                    validator_id,
+                    response.text,
+                )
+                return False
+            else:
+                if attempt > 1:
+                    logging.info(
+                        "Delete succeeded for validator=%s after %d attempts.",
+                        validator_id,
+                        attempt,
+                    )
+                return True
+
+        if not should_retry or attempt == max_attempts:
+            logging.error(
+                "Giving up on deleting validator=%s after %d attempts.",
+                validator_id,
+                max_attempts,
+            )
+            return False
+
+        logging.info(
+            "Retrying delete validator=%s in %.2fs (attempt %d/%d)...",
+            validator_id,
+            sleep_seconds,
+            attempt + 1,
+            max_attempts,
+        )
+        time.sleep(sleep_seconds)
+
+    return False
+
+
 # ------------- Main entrypoint -------------
 
 def main():
     logging.info("Starting Canton Scan → Attio Validators sync...")
+    if DRY_RUN:
+        logging.info("DRY_RUN=1 — no Attio writes or deletes will be performed.")
 
     try:
         licenses = fetch_all_validator_licenses()
@@ -290,26 +427,83 @@ def main():
         success_count = 0
         fail_count = 0
 
-        # Run Attio upserts concurrently
-        with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
-            futures = [executor.submit(upsert_validator_into_attio, lic)
-                       for lic in unique_licenses]
+        if DRY_RUN:
+            logging.info(
+                "DRY_RUN: would upsert %d validators into Attio (skipping).",
+                len(unique_licenses),
+            )
+        else:
+            # Run Attio upserts concurrently
+            with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
+                futures = [executor.submit(upsert_validator_into_attio, lic)
+                           for lic in unique_licenses]
 
-            for future in as_completed(futures):
-                try:
-                    if future.result():
-                        success_count += 1
-                    else:
+                for future in as_completed(futures):
+                    try:
+                        if future.result():
+                            success_count += 1
+                        else:
+                            fail_count += 1
+                    except Exception as exc:
+                        logging.exception("Unexpected exception in worker: %s", exc)
                         fail_count += 1
-                except Exception as exc:
-                    logging.exception("Unexpected exception in worker: %s", exc)
-                    fail_count += 1
 
-        logging.info(
-            "Completed sync. %d validators upserted successfully, %d failed.",
-            success_count,
-            fail_count,
-        )
+            logging.info(
+                "Completed upserts. %d validators upserted successfully, %d failed.",
+                success_count,
+                fail_count,
+            )
+
+        # Prune stale validators: anything in Attio whose `id` is NOT in the
+        # active set (active in the last ACTIVE_LOOKBACK_DAYS days).
+        active_ids = set(unique_by_validator.keys())
+
+        if not active_ids:
+            logging.warning(
+                "Active validator set is empty; skipping stale deletion as a safety check."
+            )
+        else:
+            attio_records = list_all_attio_validators()
+            stale = [
+                (rid, vid) for rid, vid in attio_records if vid not in active_ids
+            ]
+            logging.info(
+                "Found %d stale validators in Attio (not active in last %d days).",
+                len(stale),
+                ACTIVE_LOOKBACK_DAYS,
+            )
+            for _, vid in stale:
+                logging.info("Will delete stale validator=%s", vid)
+
+            if DRY_RUN:
+                logging.info(
+                    "DRY_RUN: would delete %d stale validators from Attio (skipping).",
+                    len(stale),
+                )
+            else:
+                delete_success = 0
+                delete_fail = 0
+
+                with ThreadPoolExecutor(max_workers=ATTIO_MAX_WORKERS) as executor:
+                    futures = [
+                        executor.submit(delete_attio_record, rid, vid)
+                        for rid, vid in stale
+                    ]
+                    for future in as_completed(futures):
+                        try:
+                            if future.result():
+                                delete_success += 1
+                            else:
+                                delete_fail += 1
+                        except Exception as exc:
+                            logging.exception("Unexpected exception in delete worker: %s", exc)
+                            delete_fail += 1
+
+                logging.info(
+                    "Completed deletions. %d stale validators deleted, %d failed.",
+                    delete_success,
+                    delete_fail,
+                )
 
     except Exception as exc:
         logging.exception("Sync failed: %s", exc)
